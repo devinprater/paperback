@@ -20,7 +20,7 @@ use wxdragon::{
 
 use crate::{
 	config::ConfigManager,
-	document::{DocumentStats, TocItem},
+	document::{DocumentStats, MarkerType, TocItem},
 	reader_core,
 	session::DocumentSession,
 	translation_manager::TranslationManager,
@@ -520,19 +520,9 @@ fn bind_bookmark_selection(params: BookmarkSelectionParams) {
 	});
 }
 
-fn bind_bookmark_jump(dialog: Dialog, jump_button: Button, selected_start: &Rc<Cell<i64>>) {
-	let dialog_for_jump = dialog;
-	let selected_start_for_jump = Rc::clone(selected_start);
-	jump_button.on_click(move |_| {
-		if selected_start_for_jump.get() >= 0 {
-			dialog_for_jump.end_modal(wxdragon::id::ID_OK);
-		} else {
-			MessageDialog::builder(&dialog_for_jump, &t("Please select a bookmark to jump to."), &t("Error"))
-				.with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError | MessageDialogStyle::Centre)
-				.build()
-				.show_modal();
-		}
-	});
+fn bind_bookmark_jump(_dialog: Dialog, _jump_button: Button, _selected_start: &Rc<Cell<i64>>) {
+	// The jump button uses ID_OK and default dialog semantics.
+	// Avoid explicit end_modal() here to prevent double-close assertions on GTK.
 }
 
 fn bind_bookmark_actions(actions: BookmarkDialogActions) {
@@ -822,14 +812,75 @@ pub fn show_toc_dialog(parent: &Frame, toc_items: &[TocItem], current_offset: i3
 	let dialog_title = t("Table of Contents");
 	let dialog = Dialog::builder(parent, &dialog_title).build();
 	let selected_offset = Rc::new(Cell::new(-1));
+	let toc_live_region_label = StaticText::builder(&dialog).with_label("").with_size(Size::new(0, 0)).build();
+	toc_live_region_label.show(false);
+	let _ = live_region::set_live_region(&toc_live_region_label);
 	let (tree, root) = build_toc_tree(dialog, toc_items, current_offset);
 	bind_toc_selection(tree, Rc::clone(&selected_offset));
 	bind_toc_activation(dialog, tree, Rc::clone(&selected_offset));
+	if selected_offset.get() < 0 {
+		if tree.get_selection().is_none()
+			&& let Some((first_child, _)) = tree.get_first_child(&root)
+		{
+			tree.select_item(&first_child);
+			tree.set_focused_item(&first_child);
+			tree.ensure_visible(&first_child);
+		}
+		if let Some(item) = tree.get_selection() {
+			if let Some(data) = tree.get_custom_data(&item) {
+				if let Some(offset) = data.downcast_ref::<i32>() {
+					selected_offset.set(*offset);
+				}
+			}
+		}
+	}
 	let search_string = Rc::new(RefCell::new(String::new()));
 	let search_timer = Rc::new(Timer::new(&dialog));
 	bind_toc_search(tree, root, &search_string, &search_timer);
+	#[cfg(target_os = "linux")]
+	let toc_poll_timer = Rc::new(Timer::new(&dialog));
 	let (ok_button, cancel_button) = build_toc_buttons(dialog);
 	bind_toc_ok(dialog, ok_button, Rc::clone(&selected_offset));
+	#[cfg(target_os = "linux")]
+	{
+		let tree_for_poll = tree;
+		let selected_offset_for_poll = Rc::clone(&selected_offset);
+		let live_region_label_for_poll = toc_live_region_label;
+		let last_announced_state = Rc::new(Cell::new((i32::MIN, i8::MIN)));
+		let last_announced_state_for_poll = Rc::clone(&last_announced_state);
+		toc_poll_timer.on_tick(move |_| {
+			let Some(item) = tree_for_poll.get_selection() else {
+				return;
+			};
+			let Some(data) = tree_for_poll.get_custom_data(&item) else {
+				return;
+			};
+			let Some(offset) = data.downcast_ref::<i32>() else {
+				return;
+			};
+			selected_offset_for_poll.set(*offset);
+			let state_code = if tree_for_poll.item_has_children(&item) {
+				if tree_for_poll.is_expanded(&item) { 1 } else { 0 }
+			} else {
+				-1
+			};
+			let current_state = (*offset, state_code);
+			let previous_state = last_announced_state_for_poll.get();
+			if previous_state == current_state {
+				return;
+			}
+			last_announced_state_for_poll.set(current_state);
+			let same_item_state_change =
+				previous_state.0 == current_state.0 && previous_state.1 != current_state.1 && current_state.1 >= 0;
+			if same_item_state_change {
+				let message = if current_state.1 == 1 { t("expanded") } else { t("collapsed") };
+				live_region::announce(live_region_label_for_poll, &message);
+			} else if let Some(message) = format_toc_announcement(tree_for_poll, &item) {
+				live_region::announce(live_region_label_for_poll, &message);
+			}
+		});
+		toc_poll_timer.start(80, false);
+	}
 	bind_toc_layout(dialog, tree, ok_button, cancel_button);
 	tree.set_focus();
 	if dialog.show_modal() == wxdragon::id::ID_OK {
@@ -864,6 +915,20 @@ fn bind_toc_selection(tree: TreeCtrl, selected_offset: Rc<Cell<i32>>) {
 			}
 		}
 	});
+}
+
+fn format_toc_announcement(tree: TreeCtrl, item: &TreeItemId) -> Option<String> {
+	let text = tree.get_item_text(item)?;
+	let text = text.trim();
+	if text.is_empty() {
+		return None;
+	}
+	if tree.item_has_children(item) {
+		let state = if tree.is_expanded(item) { t("expanded") } else { t("collapsed") };
+		Some(format!("{text}, {state}"))
+	} else {
+		Some(text.to_string())
+	}
 }
 
 fn bind_toc_activation(dialog: Dialog, tree: TreeCtrl, selected_offset: Rc<Cell<i32>>) {
@@ -1945,6 +2010,437 @@ pub fn show_web_view_dialog(
 	dialog.show_modal();
 }
 
+#[cfg(target_os = "linux")]
+pub fn show_elements_dialog(parent: &Frame, session: &DocumentSession, current_pos: i64) -> Option<i64> {
+	let dialog = Dialog::builder(parent, &t("Elements")).build();
+	let ElementsDialogUi { content_sizer, filter_choice, elements_list } = build_elements_dialog_ui(dialog);
+	let selected_offset = Rc::new(Cell::new(-1i64));
+	let close_requested = Rc::new(Cell::new(false));
+	let close_timer = Rc::new(Timer::new(&dialog));
+	let all_items = Rc::new(collect_elements(session, current_pos));
+	let element_offsets = Rc::new(RefCell::new(Vec::new()));
+	let close_requested_for_timer = Rc::clone(&close_requested);
+	let dialog_for_close_timer = dialog;
+	close_timer.on_tick(move |_| {
+		if close_requested_for_timer.get() && dialog_for_close_timer.is_shown() {
+			dialog_for_close_timer.end_modal(wxdragon::id::ID_OK);
+		}
+	});
+	let repopulate: Rc<dyn Fn()> = {
+		let filter_choice_for_repopulate = filter_choice;
+		let elements_list_for_repopulate = elements_list;
+		let all_items_for_repopulate = Rc::clone(&all_items);
+		let element_offsets_for_repopulate = Rc::clone(&element_offsets);
+		let selected_offset_for_repopulate = Rc::clone(&selected_offset);
+		Rc::new(move || {
+			repopulate_elements_dialog(
+				filter_choice_for_repopulate,
+				elements_list_for_repopulate,
+				&all_items_for_repopulate,
+				&element_offsets_for_repopulate,
+				&selected_offset_for_repopulate,
+				current_pos,
+			);
+		})
+	};
+	repopulate();
+	bind_elements_filter(filter_choice, Rc::clone(&repopulate));
+	bind_elements_selection(elements_list, &selected_offset, &element_offsets);
+	bind_elements_activation(dialog, elements_list, &selected_offset, &element_offsets, &close_requested, &close_timer);
+	let (ok_button, cancel_button) = build_elements_buttons(dialog);
+	bind_elements_ok_action(
+		dialog,
+		elements_list,
+		&element_offsets,
+		&selected_offset,
+		ok_button,
+		&close_requested,
+		&close_timer,
+	);
+	finalize_elements_layout(dialog, content_sizer, ok_button, cancel_button);
+	elements_list.set_focus();
+	let initial_focus_timer = Rc::new(Timer::new(&dialog));
+	let elements_list_for_focus = elements_list;
+	initial_focus_timer.on_tick(move |_| {
+		elements_list_for_focus.set_focus();
+	});
+	initial_focus_timer.start(1, true);
+	if dialog.show_modal() == wxdragon::id::ID_OK {
+		let offset = selected_offset.get();
+		if offset >= 0 { Some(offset) } else { None }
+	} else {
+		None
+	}
+}
+
+#[cfg(target_os = "linux")]
+struct ElementsDialogUi {
+	content_sizer: BoxSizer,
+	filter_choice: ComboBox,
+	elements_list: ListBox,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ElementsKind {
+	Section,
+	Heading,
+	Page,
+	Link,
+	Table,
+	Separator,
+	List,
+	ListItem,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum ElementsFilter {
+	All,
+	Headings,
+	Links,
+	Sections,
+	Pages,
+	Tables,
+	Separators,
+	Lists,
+	ListItems,
+}
+
+#[cfg(target_os = "linux")]
+impl ElementsFilter {
+	const DEFAULT_SELECTION: u32 = 1;
+
+	const fn from_selection(selection: u32) -> Self {
+		match selection {
+			1 => Self::Headings,
+			2 => Self::Links,
+			3 => Self::Sections,
+			4 => Self::Pages,
+			5 => Self::Tables,
+			6 => Self::Separators,
+			7 => Self::Lists,
+			8 => Self::ListItems,
+			_ => Self::All,
+		}
+	}
+
+	fn matches(self, kind: ElementsKind) -> bool {
+		match self {
+			Self::All => true,
+			Self::Headings => kind == ElementsKind::Heading,
+			Self::Links => kind == ElementsKind::Link,
+			Self::Sections => kind == ElementsKind::Section,
+			Self::Pages => kind == ElementsKind::Page,
+			Self::Tables => kind == ElementsKind::Table,
+			Self::Separators => kind == ElementsKind::Separator,
+			Self::Lists => kind == ElementsKind::List,
+			Self::ListItems => kind == ElementsKind::ListItem,
+		}
+	}
+}
+
+#[cfg(target_os = "linux")]
+struct ElementsDialogItem {
+	display: String,
+	offset: i64,
+	kind: ElementsKind,
+}
+
+#[cfg(target_os = "linux")]
+fn build_elements_dialog_ui(dialog: Dialog) -> ElementsDialogUi {
+	let content_sizer = BoxSizer::builder(Orientation::Vertical).build();
+	let filter_sizer = BoxSizer::builder(Orientation::Horizontal).build();
+	let filter_label = StaticText::builder(&dialog).with_label(&t("&Filter:")).build();
+	let filter_choice = ComboBox::builder(&dialog).with_style(ComboBoxStyle::ReadOnly).build();
+	filter_choice.append(&t("All Elements"));
+	filter_choice.append(&t("Headings"));
+	filter_choice.append(&t("Links"));
+	filter_choice.append(&t("Sections"));
+	filter_choice.append(&t("Pages"));
+	filter_choice.append(&t("Tables"));
+	filter_choice.append(&t("Separators"));
+	filter_choice.append(&t("Lists"));
+	filter_choice.append(&t("List Items"));
+	filter_choice.set_selection(ElementsFilter::DEFAULT_SELECTION);
+	filter_sizer.add(&filter_label, 0, SizerFlag::AlignCenterVertical | SizerFlag::Right, DIALOG_PADDING);
+	filter_sizer.add(&filter_choice, 1, SizerFlag::Expand, 0);
+	content_sizer.add_sizer(&filter_sizer, 0, SizerFlag::Expand | SizerFlag::All, DIALOG_PADDING);
+	let elements_label = StaticText::builder(&dialog).with_label(&t("&Elements:")).build();
+	let elements_list = ListBox::builder(&dialog).with_size(Size::new(500, 500)).build();
+	let elements_sizer = BoxSizer::builder(Orientation::Vertical).build();
+	elements_sizer.add(&elements_list, 1, SizerFlag::Expand, 0);
+	content_sizer.add(&elements_label, 0, SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, DIALOG_PADDING);
+	content_sizer.add_sizer(
+		&elements_sizer,
+		1,
+		SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right | SizerFlag::Bottom,
+		DIALOG_PADDING,
+	);
+	ElementsDialogUi { content_sizer, filter_choice, elements_list }
+}
+
+#[cfg(target_os = "linux")]
+const fn kind_for_marker(mtype: MarkerType) -> Option<ElementsKind> {
+	match mtype {
+		MarkerType::Heading1
+		| MarkerType::Heading2
+		| MarkerType::Heading3
+		| MarkerType::Heading4
+		| MarkerType::Heading5
+		| MarkerType::Heading6 => Some(ElementsKind::Heading),
+		MarkerType::PageBreak => Some(ElementsKind::Page),
+		MarkerType::SectionBreak => Some(ElementsKind::Section),
+		MarkerType::Link => Some(ElementsKind::Link),
+		MarkerType::List => Some(ElementsKind::List),
+		MarkerType::ListItem => Some(ElementsKind::ListItem),
+		MarkerType::Table => Some(ElementsKind::Table),
+		MarkerType::Separator => Some(ElementsKind::Separator),
+		MarkerType::TocItem => None,
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn display_text_for_item(_kind: ElementsKind, text: &str) -> String {
+	text.to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn collect_elements(session: &DocumentSession, current_pos: i64) -> Vec<ElementsDialogItem> {
+	let mut items = Vec::new();
+	let heading_data = session.heading_tree(current_pos);
+	let _ = heading_data.closest_index;
+	for heading in heading_data.items {
+		let _ = heading.parent_index;
+		let offset = i64::try_from(heading.offset).unwrap_or(i64::MAX);
+		let text = if heading.text.trim().is_empty() { t("Untitled") } else { heading.text };
+		let display = display_text_for_item(ElementsKind::Heading, &text);
+		items.push(ElementsDialogItem { display, offset, kind: ElementsKind::Heading });
+	}
+	let link_data = session.link_list(current_pos);
+	let _ = link_data.closest_index;
+	for link in link_data.items {
+		let offset = i64::try_from(link.offset).unwrap_or(i64::MAX);
+		let text = if link.text.trim().is_empty() { t("Untitled") } else { link.text };
+		let display = display_text_for_item(ElementsKind::Link, &text);
+		items.push(ElementsDialogItem { display, offset, kind: ElementsKind::Link });
+	}
+	for marker in &session.handle().document().buffer.markers {
+		let Some(kind) = kind_for_marker(marker.mtype) else {
+			continue;
+		};
+		if matches!(kind, ElementsKind::Heading | ElementsKind::Link) {
+			continue;
+		}
+		let offset = i64::try_from(marker.position).unwrap_or(i64::MAX);
+		let text = if marker.text.trim().is_empty() {
+			let fallback = session.get_line_text(offset);
+			if fallback.trim().is_empty() { t("Untitled") } else { fallback }
+		} else {
+			marker.text.clone()
+		};
+		let display = display_text_for_item(kind, &text);
+		items.push(ElementsDialogItem { display, offset, kind });
+	}
+	items.sort_by(|left, right| left.offset.cmp(&right.offset).then_with(|| left.display.cmp(&right.display)));
+	items
+}
+
+#[cfg(target_os = "linux")]
+fn repopulate_elements_dialog(
+	filter_choice: ComboBox,
+	elements_list: ListBox,
+	all_items: &Rc<Vec<ElementsDialogItem>>,
+	element_offsets: &Rc<RefCell<Vec<i64>>>,
+	selected_offset: &Rc<Cell<i64>>,
+	current_pos: i64,
+) {
+	let filter = ElementsFilter::from_selection(filter_choice.get_selection().unwrap_or(ElementsFilter::DEFAULT_SELECTION));
+	let target_position = if selected_offset.get() >= 0 { selected_offset.get() } else { current_pos };
+	elements_list.clear();
+	let mut offsets = element_offsets.borrow_mut();
+	offsets.clear();
+	let mut selected_index = None;
+	let mut selected_distance = i128::MAX;
+	for item in all_items.iter().filter(|item| filter.matches(item.kind)) {
+		elements_list.append(&item.display);
+		offsets.push(item.offset);
+		let index = offsets.len() - 1;
+		let distance = (i128::from(item.offset) - i128::from(target_position)).abs();
+		if distance < selected_distance {
+			selected_distance = distance;
+			selected_index = Some(index);
+		}
+	}
+	if offsets.is_empty() {
+		elements_list.append(&t("No elements found."));
+		elements_list.enable(false);
+		selected_offset.set(-1);
+		return;
+	}
+	elements_list.enable(true);
+	let idx = selected_index.unwrap_or(0);
+	if let Ok(idx_u32) = u32::try_from(idx) {
+		elements_list.set_selection(idx_u32, true);
+	}
+	selected_offset.set(offsets[idx]);
+}
+
+#[cfg(target_os = "linux")]
+fn bind_elements_filter(filter_choice: ComboBox, repopulate: Rc<dyn Fn()>) {
+	filter_choice.on_selection_changed(move |_| {
+		repopulate();
+	});
+}
+
+#[cfg(target_os = "linux")]
+fn bind_elements_selection(
+	elements_list: ListBox,
+	selected_offset: &Rc<Cell<i64>>,
+	element_offsets: &Rc<RefCell<Vec<i64>>>,
+) {
+	let selected_offset_for_selection = Rc::clone(selected_offset);
+	let offsets_for_selection = Rc::clone(element_offsets);
+	elements_list.on_selection_changed(move |event| {
+		if let Some(index) = event.get_selection().and_then(|idx| usize::try_from(idx).ok()) {
+			if let Some(offset) = offsets_for_selection.borrow().get(index) {
+				selected_offset_for_selection.set(*offset);
+				return;
+			}
+		}
+		selected_offset_for_selection.set(-1);
+	});
+}
+
+#[cfg(target_os = "linux")]
+fn bind_elements_activation(
+	dialog: Dialog,
+	elements_list: ListBox,
+	selected_offset: &Rc<Cell<i64>>,
+	element_offsets: &Rc<RefCell<Vec<i64>>>,
+	close_requested: &Rc<Cell<bool>>,
+	close_timer: &Rc<Timer<Dialog>>,
+) {
+	let selected_offset_for_list = Rc::clone(selected_offset);
+	let offsets_for_list = Rc::clone(element_offsets);
+	let close_requested_for_list = Rc::clone(close_requested);
+	let close_timer_for_list = Rc::clone(close_timer);
+	let dialog_for_list = dialog;
+	elements_list.on_item_double_clicked(move |event| {
+		let selection = event.get_selection().unwrap_or(-1);
+		if selection >= 0 {
+			if let Ok(index) = usize::try_from(selection) {
+				if let Some(offset) = offsets_for_list.borrow().get(index) {
+					selected_offset_for_list.set(*offset);
+					request_elements_dialog_close(
+						&close_requested_for_list,
+						&close_timer_for_list,
+						&dialog_for_list,
+						wxdragon::id::ID_OK,
+					);
+				}
+			}
+		}
+	});
+	let selected_offset_for_key = Rc::clone(selected_offset);
+	let offsets_for_key = Rc::clone(element_offsets);
+	let close_requested_for_key = Rc::clone(close_requested);
+	let close_timer_for_key = Rc::clone(close_timer);
+	let dialog_for_key = dialog;
+	let elements_list_for_key = elements_list;
+	elements_list.bind_internal(EventType::KEY_DOWN, move |event| {
+		if let Some(key) = event.get_key_code() {
+			if key == KEY_RETURN || key == KEY_NUMPAD_ENTER {
+				if let Some(selection) = elements_list_for_key.get_selection().and_then(|idx| usize::try_from(idx).ok()) {
+					if let Some(offset) = offsets_for_key.borrow().get(selection) {
+						selected_offset_for_key.set(*offset);
+						request_elements_dialog_close(
+							&close_requested_for_key,
+							&close_timer_for_key,
+							&dialog_for_key,
+							wxdragon::id::ID_OK,
+						);
+					}
+				}
+				event.skip(false);
+				return;
+			}
+		}
+		event.skip(true);
+	});
+}
+
+#[cfg(target_os = "linux")]
+fn build_elements_buttons(dialog: Dialog) -> (Button, Button) {
+	let ok_button = Button::builder(&dialog).with_label(&t("OK")).build();
+	let cancel_button = Button::builder(&dialog).with_id(wxdragon::id::ID_CANCEL).with_label(&t("Cancel")).build();
+	dialog.set_escape_id(wxdragon::id::ID_CANCEL);
+	ok_button.set_default();
+	(ok_button, cancel_button)
+}
+
+#[cfg(target_os = "linux")]
+fn bind_elements_ok_action(
+	dialog: Dialog,
+	elements_list: ListBox,
+	element_offsets: &Rc<RefCell<Vec<i64>>>,
+	selected_offset: &Rc<Cell<i64>>,
+	ok_button: Button,
+	close_requested: &Rc<Cell<bool>>,
+	close_timer: &Rc<Timer<Dialog>>,
+) {
+	let offsets_for_ok = Rc::clone(element_offsets);
+	let selected_offset_for_ok = Rc::clone(selected_offset);
+	let close_requested_for_ok = Rc::clone(close_requested);
+	let close_timer_for_ok = Rc::clone(close_timer);
+	let dialog_for_ok = dialog;
+	ok_button.on_click(move |_| {
+		if let Some(index) = elements_list.get_selection().and_then(|idx| usize::try_from(idx).ok()) {
+			if let Some(offset) = offsets_for_ok.borrow().get(index) {
+				selected_offset_for_ok.set(*offset);
+				request_elements_dialog_close(
+					&close_requested_for_ok,
+					&close_timer_for_ok,
+					&dialog_for_ok,
+					wxdragon::id::ID_OK,
+				);
+				return;
+			}
+		}
+		MessageDialog::builder(&dialog_for_ok, &t("Please select an element."), &t("No Selection"))
+			.with_style(MessageDialogStyle::OK | MessageDialogStyle::IconWarning | MessageDialogStyle::Centre)
+			.build()
+			.show_modal();
+	});
+}
+
+#[cfg(target_os = "linux")]
+fn request_elements_dialog_close(
+	close_requested: &Rc<Cell<bool>>,
+	close_timer: &Rc<Timer<Dialog>>,
+	dialog: &Dialog,
+	return_code: i32,
+) {
+	if close_requested.get() {
+		return;
+	}
+	close_requested.set(true);
+	dialog.set_return_code(return_code);
+	close_timer.start(1, true);
+}
+
+#[cfg(target_os = "linux")]
+fn finalize_elements_layout(dialog: Dialog, content_sizer: BoxSizer, ok_button: Button, cancel_button: Button) {
+	let button_sizer = BoxSizer::builder(Orientation::Horizontal).build();
+	button_sizer.add_stretch_spacer(1);
+	button_sizer.add(&ok_button, 0, SizerFlag::All, DIALOG_PADDING);
+	button_sizer.add(&cancel_button, 0, SizerFlag::All, DIALOG_PADDING);
+	content_sizer.add_sizer(&button_sizer, 0, SizerFlag::Expand, 0);
+	dialog.set_sizer_and_fit(content_sizer, true);
+	dialog.centre();
+}
+
+#[cfg(not(target_os = "linux"))]
 pub fn show_elements_dialog(parent: &Frame, session: &DocumentSession, current_pos: i64) -> Option<i64> {
 	let dialog = Dialog::builder(parent, &t("Elements")).build();
 	let ElementsDialogUi { content_sizer, view_choice, headings_tree, links_list } = build_elements_dialog_ui(dialog);
@@ -1967,6 +2463,7 @@ pub fn show_elements_dialog(parent: &Frame, session: &DocumentSession, current_p
 	}
 }
 
+#[cfg(not(target_os = "linux"))]
 struct ElementsDialogUi {
 	content_sizer: BoxSizer,
 	view_choice: ComboBox,
@@ -1974,6 +2471,7 @@ struct ElementsDialogUi {
 	links_list: ListBox,
 }
 
+#[cfg(not(target_os = "linux"))]
 fn build_elements_dialog_ui(dialog: Dialog) -> ElementsDialogUi {
 	let content_sizer = BoxSizer::builder(Orientation::Vertical).build();
 	let choice_sizer = BoxSizer::builder(Orientation::Horizontal).build();
@@ -2010,6 +2508,7 @@ fn build_elements_dialog_ui(dialog: Dialog) -> ElementsDialogUi {
 	ElementsDialogUi { content_sizer, view_choice, headings_tree, links_list }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn populate_elements_dialog(
 	session: &DocumentSession,
 	current_pos: i64,
@@ -2067,6 +2566,7 @@ fn populate_elements_dialog(
 	(selected_offset, Rc::new(link_offsets))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn bind_elements_view_toggle(view_choice: ComboBox, headings_tree: TreeCtrl, links_list: ListBox, dialog: Dialog) {
 	let headings_tree_for_choice = headings_tree;
 	let links_list_for_choice = links_list;
@@ -2086,6 +2586,7 @@ fn bind_elements_view_toggle(view_choice: ComboBox, headings_tree: TreeCtrl, lin
 	});
 }
 
+#[cfg(not(target_os = "linux"))]
 fn bind_elements_activation(
 	dialog: Dialog,
 	headings_tree: TreeCtrl,
@@ -2122,6 +2623,7 @@ fn bind_elements_activation(
 	});
 }
 
+#[cfg(not(target_os = "linux"))]
 fn build_elements_buttons(dialog: Dialog) -> (Button, Button) {
 	let ok_button = Button::builder(&dialog).with_id(wxdragon::id::ID_OK).with_label(&t("OK")).build();
 	let cancel_button = Button::builder(&dialog).with_id(wxdragon::id::ID_CANCEL).with_label(&t("Cancel")).build();
@@ -2130,6 +2632,7 @@ fn build_elements_buttons(dialog: Dialog) -> (Button, Button) {
 	(ok_button, cancel_button)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn bind_elements_ok_action(
 	dialog: Dialog,
 	view_choice: ComboBox,
@@ -2164,6 +2667,7 @@ fn bind_elements_ok_action(
 	});
 }
 
+#[cfg(not(target_os = "linux"))]
 fn finalize_elements_layout(dialog: Dialog, content_sizer: BoxSizer, ok_button: Button, cancel_button: Button) {
 	let button_sizer = BoxSizer::builder(Orientation::Horizontal).build();
 	button_sizer.add_stretch_spacer(1);

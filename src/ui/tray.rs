@@ -88,14 +88,24 @@ fn create_tray_state(
 			_ => {}
 		});
 	}
-	// On Windows/Linux, also restore on click and double-click
-	#[cfg(any(target_os = "windows", target_os = "linux"))]
+	#[cfg(target_os = "windows")]
+	{
+		let doc_manager_click = Rc::clone(&doc_manager);
+		let tray_state_click = Rc::clone(&tray_state);
+		icon.on_left_up(move |_event| {
+			restore_from_tray(frame, &doc_manager_click, &tray_state_click);
+		});
+	}
+	#[cfg(target_os = "linux")]
 	{
 		let doc_manager_click = Rc::clone(&doc_manager);
 		let tray_state_click = Rc::clone(&tray_state);
 		icon.on_left_down(move |_event| {
 			restore_from_tray(frame, &doc_manager_click, &tray_state_click);
 		});
+	}
+	#[cfg(any(target_os = "windows", target_os = "linux"))]
+	{
 		icon.on_left_double_click(move |_event| {
 			restore_from_tray(frame, &doc_manager, &tray_state);
 		});

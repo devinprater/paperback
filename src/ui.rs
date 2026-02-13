@@ -1,4 +1,3 @@
-mod accessibility;
 mod app;
 mod dialogs;
 mod document_manager;

@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: paperback 0.8.0\n"
 "Report-Msgid-Bugs-To: https://github.com/trypsynth/paperback/issues\n"
-"POT-Creation-Date: 2026-02-11 12:18-0600\n"
+"POT-Creation-Date: 2026-02-13 13:16-0600\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -100,12 +100,6 @@ msgstr ""
 msgid "blank"
 msgstr ""
 
-msgid "Please select a bookmark to jump to."
-msgstr ""
-
-msgid "Error"
-msgstr ""
-
 msgid "Bookmark Note"
 msgstr ""
 
@@ -119,6 +113,12 @@ msgid "Close"
 msgstr ""
 
 msgid "Table of Contents"
+msgstr ""
+
+msgid "expanded"
+msgstr ""
+
+msgid "collapsed"
 msgstr ""
 
 msgid "Root"
@@ -267,7 +267,7 @@ msgstr ""
 msgid "Elements"
 msgstr ""
 
-msgid "&View:"
+msgid "All Elements"
 msgstr ""
 
 msgid "Headings"
@@ -276,10 +276,43 @@ msgstr ""
 msgid "Links"
 msgstr ""
 
+msgid "Sections"
+msgstr ""
+
+msgid "Pages"
+msgstr ""
+
+msgid "Tables"
+msgstr ""
+
+msgid "Separators"
+msgstr ""
+
+msgid "Lists"
+msgstr ""
+
+msgid "List Items"
+msgstr ""
+
+msgid "&Elements:"
+msgstr ""
+
+msgid "No elements found."
+msgstr ""
+
+msgid "Please select an element."
+msgstr ""
+
+msgid "&View:"
+msgstr ""
+
 msgid "An accessible, lightweight, fast ebook and document reader"
 msgstr ""
 
 msgid "File not found: {}"
+msgstr ""
+
+msgid "Error"
 msgstr ""
 
 msgid "Password is required."
@@ -295,9 +328,6 @@ msgid "Table View"
 msgstr ""
 
 msgid "Ready"
-msgstr ""
-
-msgid "File menu"
 msgstr ""
 
 msgid "&Password:"
@@ -1009,7 +1039,7 @@ msgid "Wrapping to end. "
 msgstr ""
 
 #, c-format
-msgid "Heading level %d: %s"
+msgid "%s Heading level %d"
 msgstr ""
 
 #, c-format

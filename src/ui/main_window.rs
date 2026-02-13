@@ -15,7 +15,6 @@ use std::{
 use wxdragon::{prelude::*, timer::Timer, translations::translate as t};
 
 use super::{
-	accessibility,
 	dialogs::{self, OptionsDialogFlags},
 	document_manager::DocumentManager,
 	find::{self, FindDialogState},
@@ -34,6 +33,8 @@ use crate::{
 
 const KEY_DELETE: i32 = 127;
 const KEY_NUMPAD_DELETE: i32 = 330;
+const KEY_F7: i32 = 346;
+const KEY_F7_GTK: i32 = 65_476;
 
 pub static SLEEP_TIMER_START_MS: AtomicI64 = AtomicI64::new(0);
 pub static SLEEP_TIMER_DURATION_MINUTES: AtomicI32 = AtomicI32::new(0);
@@ -91,6 +92,15 @@ impl MainWindow {
 		notebook.on_key_down(move |event| {
 			if let wxdragon::event::WindowEventData::Keyboard(key_event) = &event {
 				if let Some(key) = key_event.get_key_code() {
+					if (key == KEY_F7 || key == KEY_F7_GTK)
+						&& !key_event.shift_down()
+						&& !key_event.cmd_down() && !key_event.control_down()
+						&& !key_event.alt_down() && !key_event.meta_down()
+					{
+						frame_copy.post_menu_command(menu_ids::ELEMENTS_LIST);
+						event.skip(false);
+						return;
+					}
 					if key == KEY_DELETE || key == KEY_NUMPAD_DELETE {
 						let mut dm = dm.lock().unwrap();
 						if let Some(index) = dm.active_tab_index() {
@@ -105,6 +115,23 @@ impl MainWindow {
 						}
 						drop(dm);
 						menu::update_menu_item_states(&frame_copy, has_docs);
+						event.skip(false);
+						return;
+					}
+				}
+			}
+			event.skip(true);
+		});
+		let frame_copy = frame;
+		frame.on_key_down(move |event| {
+			if let wxdragon::event::WindowEventData::Keyboard(key_event) = &event {
+				if let Some(key) = key_event.get_key_code() {
+					if (key == KEY_F7 || key == KEY_F7_GTK)
+						&& !key_event.shift_down()
+						&& !key_event.cmd_down() && !key_event.control_down()
+						&& !key_event.alt_down() && !key_event.meta_down()
+					{
+						frame_copy.post_menu_command(menu_ids::ELEMENTS_LIST);
 						event.skip(false);
 						return;
 					}
@@ -453,7 +480,7 @@ impl MainWindow {
 							};
 							let page_count = tab.session.page_count();
 							if page_count == 0 {
-								accessibility::announce(live_region_label, &t("No pages."));
+								live_region::announce(live_region_label, &t("No pages."));
 								return;
 							}
 							let current_pos = tab.text_ctrl.get_insertion_point();
@@ -950,6 +977,7 @@ impl MainWindow {
 				menu_ids::ELEMENTS_LIST => {
 					let mut dm_guard = dm.lock().unwrap();
 					if let Some(tab) = dm_guard.active_tab_mut() {
+						live_region::announce(live_region_label, &t("Elements"));
 						let current_pos = tab.text_ctrl.get_insertion_point();
 						if let Some(offset) = dialogs::show_elements_dialog(&frame_copy, &tab.session, current_pos) {
 							tab.text_ctrl.set_focus();
@@ -1069,7 +1097,7 @@ impl MainWindow {
 						SLEEP_TIMER_DURATION_MINUTES.store(0, Ordering::SeqCst);
 						let dm_ref = dm.lock().unwrap();
 						update_title_from_manager(&frame_copy, &dm_ref);
-						accessibility::announce(live_region_label, &t("Sleep timer cancelled."));
+						live_region::announce(live_region_label, &t("Sleep timer cancelled."));
 						return;
 					}
 					let initial_duration = config.lock().unwrap().get_app_int("sleep_timer_duration", 30);
@@ -1096,7 +1124,7 @@ impl MainWindow {
 						} else {
 							t("Sleep timer set for %d minutes.").replace("%d", &duration.to_string())
 						};
-						accessibility::announce(live_region_label, &msg);
+						live_region::announce(live_region_label, &msg);
 					}
 				}
 				menu_ids::ABOUT => {
@@ -1145,7 +1173,7 @@ impl MainWindow {
 							!config_guard.get_all_documents().is_empty()
 						};
 						if !has_documents {
-							accessibility::announce(live_region_label, &t("No recent documents."));
+							live_region::announce(live_region_label, &t("No recent documents."));
 							return;
 						}
 						let open_paths = dm.lock().unwrap().open_paths();
